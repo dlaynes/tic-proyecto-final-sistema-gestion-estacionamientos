@@ -22,11 +22,15 @@ from typing import Optional
 
 import paho.mqtt.client as mqtt
 
+import urllib.request
+import urllib.error
+
 DEFAULT_BROKER = os.getenv("MQTT_BROKER", "localhost")
 DEFAULT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 DEFAULT_PARKING_ID = os.getenv("PARKING_ID", "estacionamiento-central")
 DEFAULT_SPOTS = int(os.getenv("SPOTS", "8"))
 DEFAULT_INTERVAL = float(os.getenv("INTERVAL_SECONDS", "5"))
+N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "")
 
 OCCUPIED_THRESHOLD_CM = 30.0
 SENSOR_MODEL = "HC-SR04"
@@ -127,6 +131,34 @@ class ParkingSpotSimulator:
 def build_topic(parking_id: str, spot_id: str) -> str:
     return f"{TOPIC_PREFIX}/{parking_id}/espacio/{spot_id}/estado"
 
+def send_to_n8n(webhook_url: str, payload: str) -> bool:
+    """Envía una medición a n8n sin interrumpir la publicación MQTT."""
+    if not webhook_url:
+        return False
+
+    try:
+        data = payload.encode("utf-8")
+        request = urllib.request.Request(
+            webhook_url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        with urllib.request.urlopen(request, timeout=3) as response:
+            print(
+                f"n8n recibió el evento. HTTP {response.status}",
+                flush=True,
+            )
+            return 200 <= response.status < 300
+
+    except Exception as error:
+        print(
+            f"Error enviando evento a n8n: {error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
 
 def create_spots(
     quantity: int,
@@ -165,28 +197,43 @@ def publish_measurements(
     parking_id: str,
     spots: list[ParkingSpotSimulator],
     last_measurements: dict[str, SpotMeasurement],
+    webhook_url: str = "",
+    last_sent_states: Optional[dict[str, bool]] = None,
 ) -> int:
-    """Publica una medicion por espacio y actualiza el estado en memoria."""
+    """Publica por MQTT y envía a n8n el estado inicial y los cambios."""
     published = 0
+
+    if last_sent_states is None:
+        last_sent_states = {}
+
     for spot in spots:
         previous = last_measurements.get(spot.spot_id)
         measurement = spot.sample(previous)
         payload = measurement.to_json()
         topic = build_topic(parking_id, measurement.spot_id)
-        # Retained permite recuperar el ultimo estado conocido en el monitor.
+
         result = client.publish(topic, payload, qos=0, retain=True)
+
         if result.rc == mqtt.MQTT_ERR_SUCCESS:
             published += 1
             last_measurements[spot.spot_id] = measurement
+
             print(f"Publicando -> {topic} {payload}", flush=True)
+
+            previous_sent_state = last_sent_states.get(spot.spot_id)
+
+            if previous_sent_state is None or previous_sent_state != measurement.occupied:
+                if send_to_n8n(webhook_url, payload):
+                    last_sent_states[spot.spot_id] = measurement.occupied
+
         else:
             print(
                 f"Error MQTT rc={result.rc} en {topic}",
                 file=sys.stderr,
                 flush=True,
             )
-    return published
 
+    return published
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -230,10 +277,18 @@ def main() -> int:
         client_id=f"hc-sr04-{args.parking_id}",
     )
     last_measurements: dict[str, SpotMeasurement] = {}
+    last_sent_states: dict[str, bool] = {}
 
     try:
         while running:
-            publish_measurements(client, args.parking_id, spots, last_measurements)
+            publish_measurements(
+    client,
+    args.parking_id,
+    spots,
+    last_measurements,
+    webhook_url=N8N_WEBHOOK_URL,
+    last_sent_states=last_sent_states,
+)
             if args.once:
                 break
             for _ in range(int(args.interval * 10)):
